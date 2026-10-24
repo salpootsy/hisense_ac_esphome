@@ -363,6 +363,7 @@ void HisenseAC::apply_status_() {
     if (!offset_mode && valid_target && valid_mode && !transport_.busy() &&
         !(pending_.fields() & (transport::MODE | transport::TEMPERATURE)))
         save_target_temperture();
+    remember_on_settings_();
     set_sensor(compressor_frequency, status_.compressor_frequency);
     set_sensor(compressor_frequency_setting, status_.compressor_frequency_setting);
     set_sensor(compressor_frequency_send, status_.compressor_frequency_send);
@@ -476,9 +477,30 @@ void HisenseAC::control(const climate::ClimateCall &call) {
     transport::Request request;
     request.fahrenheit = temp_unit == FAHRENHEIT;
     bool valid = true;
+    // Home Assistant has no dedicated "turn on": it sends a mode-only call. When the AC is
+    // currently off, treat that as "resume where I left off" instead of the requested mode.
+    static const climate::ClimateMode kDeviceModes[] = {climate::CLIMATE_MODE_FAN_ONLY, climate::CLIMATE_MODE_HEAT,
+                                                        climate::CLIMATE_MODE_COOL, climate::CLIMATE_MODE_DRY};
+    static const climate::ClimateSwingMode kDeviceSwings[] = {climate::CLIMATE_SWING_OFF,
+                                                              climate::CLIMATE_SWING_HORIZONTAL,
+                                                              climate::CLIMATE_SWING_VERTICAL,
+                                                              climate::CLIMATE_SWING_BOTH};
+    bool restore_last = false;
+    if (call.get_mode().has_value() && *call.get_mode() != climate::CLIMATE_MODE_OFF &&
+        !call.get_target_temperature().has_value() && !call.get_fan_mode().has_value() &&
+        !call.get_swing_mode().has_value() && !call.get_preset().has_value() &&
+        last_on_mode_ <= 3 && supported_modes_.count(kDeviceModes[last_on_mode_])) {
+        const auto context = pending_.present(confirmed_, true);
+        restore_last = (context.fields & transport::MODE) && context.mode == transport::MODE_OFF;
+    }
     if (call.get_mode().has_value()) {
         request.fields |= transport::MODE;
         valid &= supported_modes_.count(*call.get_mode()) && encode_mode(*call.get_mode(), request.mode);
+        if (restore_last) {
+            ESP_LOGD(TAG, "AC=%p Turn-on call: restoring last mode %u instead of requested mode",
+                     static_cast<const void *>(this), static_cast<unsigned>(last_on_mode_));
+            request.mode = last_on_mode_;  // Per-mode target temperature is restored by the logic below.
+        }
     }
     if (dry_offset_number_ != nullptr && call.get_target_temperature().has_value()) {
         const auto context = pending_.present(confirmed_, true);
@@ -522,6 +544,16 @@ void HisenseAC::control(const climate::ClimateCall &call) {
             default: valid = false; break;
         }
     }
+    if (restore_last) {
+        if (has_last_fan_) {
+            request.fields |= transport::FAN;
+            request.fan = last_fan_;
+        }
+        if (has_last_swing_ && last_swing_ <= 3 && supported_swing_modes_.count(kDeviceSwings[last_swing_])) {
+            request.fields |= transport::SWING;
+            request.swing = last_swing_;
+        }
+    }
     uint32_t generation;
     if (!valid || request.fields == 0) {
         ESP_LOGW("hisense_ac", "Climate call rejected: invalid or unsupported controls.");
@@ -543,7 +575,38 @@ void HisenseAC::control(const climate::ClimateCall &call) {
         if (memory_mode == 1) heat_tgt_temp = request.temperature;
         else if (memory_mode == 2) cool_tgt_temp = request.temperature;
     }
+    // Remember the newest user intent too, so a quick "change fan, then off" is not lost
+    // before the next status report arrives.
+    if ((request.fields & transport::MODE) && request.mode <= 3) last_on_mode_ = request.mode;
+    if (request.fields & transport::FAN) {
+        last_fan_ = request.fan == 12 ? 10 : request.fan == 16 ? 14 : request.fan;
+        has_last_fan_ = true;
+    }
+    if (request.fields & transport::SWING) {
+        last_swing_ = request.swing;
+        has_last_swing_ = true;
+    }
     accepted_(request, generation);
+}
+
+void HisenseAC::remember_on_settings_() {
+    // Only learn from a device that is on, and never while one of our own
+    // commands is still in flight (the status could still show the old values).
+    if (status_.run_status == 0 || status_.mode_status > 3) return;
+    if (pending_.fields() & (transport::MODE | transport::FAN | transport::SWING)) return;
+    last_on_mode_ = status_.mode_status;
+    if (confirmed_.fields & transport::FAN) {
+        // The device reports five speeds but only low/medium/high can be commanded.
+        uint8_t fan = confirmed_.fan;
+        if (fan == 12) fan = 10;
+        else if (fan == 16) fan = 14;
+        last_fan_ = fan;
+        has_last_fan_ = true;
+    }
+    if (confirmed_.fields & transport::SWING) {
+        last_swing_ = confirmed_.swing;
+        has_last_swing_ = true;
+    }
 }
 
 void HisenseAC::save_target_temperture() {

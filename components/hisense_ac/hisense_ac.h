@@ -79,6 +79,13 @@ private:
     Temperature_Unit temp_unit{CELSIUS};
     float heat_tgt_temp = NAN;
     float cool_tgt_temp = NAN;
+    // Settings from the last time the AC was running. A bare "turn on" from
+    // Home Assistant (a mode-only climate call while the AC is off) restores them.
+    uint8_t last_on_mode_{transport::MODE_OFF};  // device encoding: 0=fan 1=heat 2=cool 3=dry
+    bool has_last_fan_{false};
+    uint8_t last_fan_{0};
+    bool has_last_swing_{false};
+    uint8_t last_swing_{0};
     protocol::FrameParser parser_;
     DeviceStatus status_{};
     transport::Engine transport_{this};
@@ -120,6 +127,7 @@ private:
     bool send_packet(const uint8_t *data, size_t size) override;
     void operation_finished(uint32_t generation, transport::Result result, const transport::Request &request) override;
     void apply_status_();
+    void remember_on_settings_();
     void publish_presentation_();
     void update_warning_();
     void publish_diagnostics_();
